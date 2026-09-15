@@ -1,11 +1,32 @@
 import { readFile } from "node:fs/promises"
 import path from "node:path"
 import { NextResponse } from "next/server"
+import { Redis } from "@upstash/redis"
 
 export const runtime = "nodejs"
 export const maxDuration = 300
 
 const MAX_UPLOAD_BYTES = 15 * 1024 * 1024
+const MAX_GENERATIONS = 2
+const WINDOW_SECONDS = 48 * 60 * 60
+
+const redis = new Redis({
+  url: process.env.KV_REST_API_URL!,
+  token: process.env.KV_REST_API_TOKEN!,
+})
+
+function getClientIp(request: Request): string {
+  const forwarded = request.headers.get("x-forwarded-for")
+  if (forwarded) return forwarded.split(",")[0].trim()
+  return request.headers.get("x-real-ip") || "unknown"
+}
+
+function formatWindow(seconds: number): string {
+  const hours = Math.ceil(seconds / 3600)
+  if (hours <= 1) return "about an hour"
+  if (hours < 48) return `about ${hours} hours`
+  return "a couple of days"
+}
 
 export async function POST(request: Request) {
   try {
@@ -13,6 +34,22 @@ export async function POST(request: Request) {
       return NextResponse.json(
         { error: "OPENAI_API_KEY is not configured on the server." },
         { status: 500 },
+      )
+    }
+
+    // Per-IP quota: only successful generations count toward the limit.
+    const ip = getClientIp(request)
+    const quotaKey = `curtify:gen:${ip}`
+    const used = Number((await redis.get(quotaKey)) ?? 0)
+    if (used >= MAX_GENERATIONS) {
+      const ttl = await redis.ttl(quotaKey)
+      const when = ttl > 0 ? formatWindow(ttl) : "a little while"
+      return NextResponse.json(
+        {
+          error: `You've used your ${MAX_GENERATIONS} free CURTIFY images. You can create more in ${when}.`,
+          limited: true,
+        },
+        { status: 429 },
       )
     }
 
@@ -67,6 +104,24 @@ export async function POST(request: Request) {
     const data = await response.json()
     if (!response.ok) {
       console.log("[v0] OpenAI image edit error:", JSON.stringify(data))
+
+      // Site owner's OpenAI account is out of money / quota.
+      const code = data?.error?.code || data?.error?.type
+      const isOutOfCredits =
+        response.status === 402 ||
+        code === "insufficient_quota" ||
+        code === "billing_hard_limit_reached"
+      if (isOutOfCredits) {
+        return NextResponse.json(
+          {
+            error:
+              "CURTIFY is temporarily out of credits. Please check back later once the site has been topped up.",
+            outOfCredits: true,
+          },
+          { status: 402 },
+        )
+      }
+
       return NextResponse.json(
         { error: data?.error?.message || "The image edit failed." },
         { status: response.status },
@@ -79,6 +134,12 @@ export async function POST(request: Request) {
         { error: "The image service returned no image." },
         { status: 502 },
       )
+    }
+
+    // Success: count this generation against the per-IP quota.
+    const newCount = await redis.incr(quotaKey)
+    if (newCount === 1) {
+      await redis.expire(quotaKey, WINDOW_SECONDS)
     }
 
     return NextResponse.json({ image: `data:image/png;base64,${item.b64_json}` })
